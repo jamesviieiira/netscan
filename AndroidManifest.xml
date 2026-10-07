@@ -2,21 +2,32 @@
 <!-- Caminho: android/app/src/main/AndroidManifest.xml -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- Acesso à internet (consulta de fabricante) e à rede local (scan) -->
+    <!-- Internet (consulta de fabricante) e rede local (varredura) -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
-    <!-- Leitura de IP, máscara e sinal (RSSI) do Wi-Fi -->
+    <!-- Wi-Fi: IP, sinal, busca de redes e anúncios multicast (mDNS/SSDP) -->
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
 
-    <!-- Obrigatória no Android 8.1+ para acessar dados do Wi-Fi (SSID/RSSI) -->
+    <!-- Localização: o Android exige para ler SSID, buscar Wi-Fi e Bluetooth -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+
+    <!-- Bluetooth (Android 11 e anterior) -->
+    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+
+    <!-- Bluetooth (Android 12 e posterior) -->
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
 
     <application
         android:label="NetScan Pro"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher"
+        android:usesCleartextTraffic="true"
         android:enableOnBackInvokedCallback="true">
 
         <activity
