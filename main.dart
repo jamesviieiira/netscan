@@ -91,7 +91,10 @@ class NetDevice {
   final String ip;
   final int latencyMs;
   final DeviceKind kind;
-  const NetDevice(this.ip, this.latencyMs, this.kind);
+  String? mac; // preenchido via ARP (se o Android permitir) ou manualmente
+  String? vendor; // fabricante (consulta OUI)
+  String? hostname; // nome via DNS reverso (quando o roteador informa)
+  NetDevice(this.ip, this.latencyMs, this.kind);
 
   int get lastOctet => int.tryParse(ip.split('.').last) ?? 0;
 }
@@ -261,7 +264,272 @@ class _HomePageState extends State<HomePage> {
         _devices.sort((a, b) => a.lastOctet.compareTo(b.lastOctet));
       }
       setState(() => _scanning = false);
+      unawaited(_enrichDevices(token));
     }
+  }
+
+  /// Tenta descobrir MAC (tabela ARP) e nome (DNS reverso) de cada aparelho.
+  /// No Android 10+ o acesso à tabela ARP costuma ser bloqueado; quando
+  /// falha, o MAC pode ser informado manualmente ao tocar no dispositivo.
+  Future<void> _enrichDevices(int token) async {
+    // 1) Tabela ARP (/proc/net/arp)
+    try {
+      final lines = await File('/proc/net/arp').readAsLines();
+      for (final line in lines.skip(1)) {
+        final p = line.trim().split(RegExp(r'\s+'));
+        if (p.length >= 4 && p[3] != '00:00:00:00:00:00') {
+          for (final d in _devices) {
+            if (d.ip == p[0]) d.mac = p[3].toUpperCase();
+          }
+        }
+      }
+    } catch (_) {}
+    if (!mounted || token != _scanToken) return;
+    setState(() {});
+
+    // 2) Nome do aparelho via DNS reverso
+    await Future.wait(List.of(_devices).map((d) async {
+      try {
+        final r = await InternetAddress(d.ip)
+            .reverse()
+            .timeout(const Duration(seconds: 2));
+        if (r.host != d.ip) d.hostname = r.host;
+      } catch (_) {}
+    }));
+    if (!mounted || token != _scanToken) return;
+    setState(() {});
+
+    // 3) Fabricante dos que já têm MAC (1 consulta por segundo)
+    for (final d in List.of(_devices)) {
+      if (!mounted || token != _scanToken) return;
+      if (d.mac != null && d.vendor == null) {
+        final r = await _queryVendor(d.mac!);
+        if (r.vendor != null) d.vendor = r.vendor;
+        if (mounted) setState(() {});
+      }
+    }
+  }
+
+  /// Formata qualquer entrada hexadecimal como AA:BB:CC:DD:EE:FF.
+  String _formatMac(String raw) {
+    final hex = raw.replaceAll(RegExp(r'[^0-9a-fA-F]'), '').toUpperCase();
+    final parts = <String>[];
+    for (var i = 0; i + 2 <= hex.length && i < 12; i += 2) {
+      parts.add(hex.substring(i, i + 2));
+    }
+    return parts.join(':');
+  }
+
+  /// Consulta o fabricante de um MAC (reutilizável pela lista e pela folha).
+  Future<({String? vendor, String? error, bool randomized})> _queryVendor(
+      String raw) async {
+    final hex = raw.replaceAll(RegExp(r'[^0-9a-fA-F]'), '').toUpperCase();
+    if (hex.length < 6) {
+      return (
+        vendor: null,
+        error: 'Digite ao menos os 6 primeiros dígitos do MAC.',
+        randomized: false
+      );
+    }
+    final oui = '${hex.substring(0, 2)}:${hex.substring(2, 4)}:'
+        '${hex.substring(4, 6)}';
+    final randomized = (int.parse(hex.substring(0, 2), radix: 16) & 0x02) != 0;
+
+    final since = DateTime.now().difference(_lastLookup);
+    if (since < const Duration(seconds: 1)) {
+      await Future.delayed(const Duration(seconds: 1) - since);
+    }
+    _lastLookup = DateTime.now();
+
+    try {
+      final res = await http
+          .get(Uri.parse('https://api.macvendors.com/$oui'))
+          .timeout(const Duration(seconds: 8));
+      if (res.statusCode == 200) {
+        return (vendor: res.body.trim(), error: null, randomized: randomized);
+      }
+      if (res.statusCode == 404) {
+        return (
+          vendor: null,
+          error: randomized
+              ? 'MAC privado/aleatório (recurso de privacidade do aparelho): '
+                  'não possui fabricante.'
+              : 'Fabricante não encontrado para $oui.',
+          randomized: randomized
+        );
+      }
+      if (res.statusCode == 429) {
+        return (
+          vendor: null,
+          error: 'Muitas consultas seguidas. Aguarde um instante.',
+          randomized: randomized
+        );
+      }
+      return (
+        vendor: null,
+        error: 'Erro do servidor (${res.statusCode}).',
+        randomized: randomized
+      );
+    } on TimeoutException {
+      return (
+        vendor: null,
+        error: 'Tempo esgotado. Verifique a internet.',
+        randomized: randomized
+      );
+    } catch (_) {
+      return (
+        vendor: null,
+        error: 'Falha de conexão com a API.',
+        randomized: randomized
+      );
+    }
+  }
+
+  /// Folha inferior ao tocar num dispositivo: copiar IP/MAC, informar o
+  /// MAC e consultar o fabricante daquele aparelho.
+  Future<void> _showDeviceSheet(NetDevice d) async {
+    final ctrl = TextEditingController(text: d.mac ?? '');
+    String? error;
+    bool loading = false;
+
+    void copy(String value, String what) {
+      Clipboard.setData(ClipboardData(text: value));
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(SnackBar(
+          content: Text('$what copiado'),
+          behavior: SnackBarBehavior.floating,
+          duration: const Duration(seconds: 1),
+        ));
+    }
+
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: true,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setSheet) {
+          final text = Theme.of(ctx).textTheme;
+          return SingleChildScrollView(
+            padding: EdgeInsets.fromLTRB(
+                24, 0, 24, 24 + MediaQuery.viewInsetsOf(ctx).bottom),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(d.ip,
+                              style: text.headlineSmall
+                                  ?.copyWith(fontWeight: FontWeight.w700)),
+                          if (d.hostname != null)
+                            Text(d.hostname!, style: text.bodyMedium),
+                        ],
+                      ),
+                    ),
+                    FilledButton.tonalIcon(
+                      onPressed: () => copy(d.ip, 'IP'),
+                      icon: const Icon(Icons.copy_rounded, size: 18),
+                      label: const Text('Copiar IP'),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 20),
+                TextField(
+                  controller: ctrl,
+                  autocorrect: false,
+                  textCapitalization: TextCapitalization.characters,
+                  inputFormatters: [
+                    FilteringTextInputFormatter.allow(
+                        RegExp(r'[0-9a-fA-F:.\-]')),
+                    LengthLimitingTextInputFormatter(17),
+                  ],
+                  decoration: InputDecoration(
+                    labelText: 'MAC deste aparelho',
+                    hintText: 'AA:BB:CC:DD:EE:FF',
+                    prefixIcon: const Icon(Icons.memory_rounded),
+                    suffixIcon: IconButton(
+                      tooltip: 'Colar',
+                      icon: const Icon(Icons.content_paste_rounded),
+                      onPressed: () async {
+                        final data = await Clipboard.getData('text/plain');
+                        if (data?.text != null) {
+                          ctrl.text = _formatMac(data!.text!);
+                        }
+                      },
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                Row(
+                  children: [
+                    Expanded(
+                      child: FilledButton.icon(
+                        onPressed: loading
+                            ? null
+                            : () async {
+                                setSheet(() {
+                                  loading = true;
+                                  error = null;
+                                });
+                                final r = await _queryVendor(ctrl.text);
+                                if (!ctx.mounted) return;
+                                final formatted = _formatMac(ctrl.text);
+                                if (formatted.length >= 8) d.mac = formatted;
+                                if (r.vendor != null) d.vendor = r.vendor;
+                                if (mounted) setState(() {});
+                                setSheet(() {
+                                  loading = false;
+                                  error = r.error;
+                                });
+                              },
+                        icon: loading
+                            ? const SizedBox(
+                                width: 18,
+                                height: 18,
+                                child: CircularProgressIndicator(
+                                    strokeWidth: 2.5))
+                            : const Icon(Icons.search_rounded),
+                        label: Text(loading ? 'Consultando…' : 'Consultar'),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    OutlinedButton.icon(
+                      onPressed: ctrl.text.trim().isEmpty
+                          ? null
+                          : () => copy(_formatMac(ctrl.text), 'MAC'),
+                      icon: const Icon(Icons.copy_rounded, size: 18),
+                      label: const Text('Copiar MAC'),
+                    ),
+                  ],
+                ),
+                if (d.vendor != null) _VendorResult(vendor: d.vendor!),
+                if (error != null)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 16),
+                    child: _InfoBanner(
+                        icon: Icons.info_outline_rounded, text: error!),
+                  ),
+                const SizedBox(height: 16),
+                _InfoBanner(
+                  icon: Icons.lightbulb_outline_rounded,
+                  text: 'O Android 15 bloqueia a leitura do MAC de outros '
+                      'aparelhos. Para ver o MAC, abra o painel do roteador'
+                      '${_gatewayIp != null ? ' (http://$_gatewayIp)' : ''}'
+                      ' e procure "Dispositivos conectados" ou "DHCP". '
+                      'Copie o MAC de lá e cole aqui.',
+                ),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+    ctrl.dispose();
   }
 
   void _cancelScan() {
@@ -778,7 +1046,10 @@ class _HomePageState extends State<HomePage> {
               physics: const NeverScrollableScrollPhysics(),
               itemCount: _devices.length,
               separatorBuilder: (_, __) => const SizedBox(height: 10),
-              itemBuilder: (_, i) => _DeviceTile(device: _devices[i]),
+              itemBuilder: (_, i) => _DeviceTile(
+                device: _devices[i],
+                onTap: () => _showDeviceSheet(_devices[i]),
+              ),
             ),
           ],
         ),
@@ -794,7 +1065,8 @@ class _HomePageState extends State<HomePage> {
 /// Linha de dispositivo, colorida conforme o tipo e a latência.
 class _DeviceTile extends StatelessWidget {
   final NetDevice device;
-  const _DeviceTile({required this.device});
+  final VoidCallback onTap;
+  const _DeviceTile({required this.device, required this.onTap});
 
   @override
   Widget build(BuildContext context) {
@@ -843,16 +1115,7 @@ class _DeviceTile extends StatelessWidget {
         borderRadius: BorderRadius.circular(20),
         child: InkWell(
           borderRadius: BorderRadius.circular(20),
-          onTap: () {
-            Clipboard.setData(ClipboardData(text: device.ip));
-            ScaffoldMessenger.of(context)
-              ..hideCurrentSnackBar()
-              ..showSnackBar(SnackBar(
-                content: Text('${device.ip} copiado'),
-                behavior: SnackBarBehavior.floating,
-                duration: const Duration(seconds: 1),
-              ));
-          },
+          onTap: onTap,
           child: Padding(
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
             child: Row(
@@ -875,10 +1138,40 @@ class _DeviceTile extends StatelessWidget {
                               fontFeatures: const [
                                 FontFeature.tabularFigures()
                               ])),
-                      Text(label,
+                      Text(
+                          device.hostname != null
+                              ? '$label · ${device.hostname}'
+                              : label,
                           style: TextStyle(
                               color: fg.withValues(alpha: 0.75),
                               fontSize: 13)),
+                      const SizedBox(height: 2),
+                      Row(
+                        children: [
+                          Icon(
+                              device.mac != null
+                                  ? Icons.memory_rounded
+                                  : Icons.touch_app_rounded,
+                              size: 14,
+                              color: fg.withValues(alpha: 0.75)),
+                          const SizedBox(width: 4),
+                          Flexible(
+                            child: Text(
+                              device.mac != null
+                                  ? '${device.mac}'
+                                      '${device.vendor != null ? ' · ${device.vendor}' : ''}'
+                                  : 'Toque para informar o MAC',
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                  color: fg.withValues(alpha: 0.85),
+                                  fontSize: 12.5,
+                                  fontWeight: device.mac != null
+                                      ? FontWeight.w600
+                                      : FontWeight.w400),
+                            ),
+                          ),
+                        ],
+                      ),
                     ],
                   ),
                 ),
